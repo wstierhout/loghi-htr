@@ -182,11 +182,15 @@ def initialize_strategy(use_float32: bool,
 
     # Set mixed precision policy
     if not use_float32 and len(active_gpus) > 0:
-        # Check if all GPUs support mixed precision
+        # Check if all GPUs support mixed precision. Non-CUDA devices (e.g.
+        # Apple Metal via tensorflow-metal) do not report a
+        # compute_capability; treat those as not supporting it rather than
+        # crashing with a KeyError.
         gpus_support_mixed_precision = bool(active_gpus)
         for device in active_gpus:
-            if tf.config.experimental.\
-                    get_device_details(device)['compute_capability'][0] < 7:
+            compute_capability = tf.config.experimental.\
+                get_device_details(device).get('compute_capability')
+            if compute_capability is None or compute_capability[0] < 7:
                 gpus_support_mixed_precision = False
 
         # If all GPUs support mixed precision, enable it
