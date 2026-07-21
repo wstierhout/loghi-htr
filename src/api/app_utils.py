@@ -175,6 +175,15 @@ def get_env_variable(var_name: str, default_value: str = None) -> str:
     return value
 
 
+def _queue_size(queue: mp.Queue) -> int:
+    # macOS does not implement sem_getvalue, making mp.Queue.qsize() raise
+    # NotImplementedError there; report 0 instead of breaking metrics.
+    try:
+        return queue.qsize()
+    except NotImplementedError:
+        return 0
+
+
 def initialize_queues(max_queue_size: int, max_ledger_size: int) -> Dict[str, mp.Queue]:
     """
     Initializes the communication queues for the multiprocessing workers.
@@ -205,15 +214,15 @@ def initialize_queues(max_queue_size: int, max_ledger_size: int) -> Dict[str, mp
     # Add request queue size to prometheus statistics
     request_queue_size_gauge = Gauge(
         "request_queue_size", "Request queue size")
-    request_queue_size_gauge.set_function(request_queue.qsize)
+    request_queue_size_gauge.set_function(lambda: _queue_size(request_queue))
     predicted_queue_size_gauge = Gauge(
         "predicted_queue_size", "Predicted queue size")
-    predicted_queue_size_gauge.set_function(predicted_queue.qsize)
+    predicted_queue_size_gauge.set_function(lambda: _queue_size(predicted_queue))
 
     status_queue = mp.Queue(maxsize=max_ledger_size)
     status_queue_size_gauge = Gauge(
         "status_queue_size", "Status queue size")
-    status_queue_size_gauge.set_function(status_queue.qsize)
+    status_queue_size_gauge.set_function(lambda: _queue_size(status_queue))
 
     queues = {
         "Request": request_queue,

@@ -43,6 +43,11 @@ CPU or disable mixed precision with `--use_float32`.
 
 ## Notes
 
+- Keep `LOGHI_MAX_QUEUE_SIZE` at or below 32767: macOS caps POSIX semaphore
+  values (`SEM_VALUE_MAX`), and `multiprocessing.Queue` raises
+  `OSError: [Errno 22] Invalid argument` above it. The Linux default of
+  50000 does not work here; 10000 is plenty for local use.
+
 - Mixed precision (`mixed_float16`) is enabled by default when a GPU is
   detected; pass `--use_float32` to disable it if you see degraded output.
 - Training on Metal is untested; this port targets inference.
