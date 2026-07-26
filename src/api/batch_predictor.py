@@ -8,7 +8,7 @@ import os
 import sys
 import time
 import uuid
-import multiprocessing as mp
+from queue import Empty
 
 from typing import List, Tuple
 
@@ -24,6 +24,12 @@ sys.path.append(parent_path)
 # > Local imports
 from model.management import load_model_from_directory  # noqa
 from setup.environment import initialize_strategy  # noqa
+
+# Value used to pad variable-width images into a rectangular batch
+PADDING_VALUE = -10.0
+# Batch widths are rounded up to a multiple of this, so TensorFlow/Metal only
+# ever sees a bounded set of input shapes instead of a new one per batch
+WIDTH_BUCKET = 64
 
 
 def setup_gpu_environment(gpus: str) -> List[tf.config.PhysicalDevice]:
@@ -182,36 +188,25 @@ def create_model(
     return model, num_channels
 
 
-def process_sample(
-    image_bytes: tf.Tensor,
-    group_id: tf.Tensor,
-    identifier: tf.Tensor,
-    model: tf.Tensor,
-    whitelist: tf.Tensor,
-    num_channels: int,
-) -> tuple:
+def prepare_image(
+    image_bytes: bytes, identifier: str, num_channels: int
+) -> np.ndarray:
     """
-    Preprocess a single sample for the dataset.
+    Decode and preprocess a single image eagerly.
 
     Parameters
     ----------
-    image_bytes : tf.Tensor
+    image_bytes : bytes
         Raw image bytes.
-    group_id : tf.Tensor
-        Group identifier.
-    identifier : tf.Tensor
-        Sample identifier.
-    model : tf.Tensor
-        Model path.
-    whitelist : tf.Tensor
-        Whitelist metadata.
+    identifier : str
+        Sample identifier, used for error reporting.
     num_channels : int
         Number of channels expected in the image.
 
     Returns
     -------
-    tuple
-        A tuple containing the processed image and associated metadata.
+    np.ndarray
+        Preprocessed image in WHC layout.
     """
     try:
         image = tf.io.decode_image(
@@ -219,14 +214,10 @@ def process_sample(
         )
     except tf.errors.InvalidArgumentError:
         image = tf.zeros([64, 64, num_channels], dtype=tf.float32)
-        logging.error(
-            "Invalid image for identifier: %s", identifier.numpy().decode("utf-8")
-        )
+        logging.error("Invalid image for identifier: %s", identifier)
 
     # Resize and normalize the image
-    image = tf.image.resize(
-        image, [64, tf.constant(99999, dtype=tf.int32)], preserve_aspect_ratio=True
-    )
+    image = tf.image.resize(image, [64, 99999], preserve_aspect_ratio=True)
     image = tf.cast(image, tf.float32) / 255.0
 
     # Resize and pad the image
@@ -240,150 +231,137 @@ def process_sample(
     # Transpose the image dimensions if necessary
     image = tf.transpose(image, perm=[1, 0, 2])  # From HWC to WHC
 
-    return image, group_id, identifier, model, whitelist
+    return image.numpy()
 
 
-def data_generator(
-    request_queue: multiprocessing.Queue,
-    current_model_path_holder: list,
-    stop_event: multiprocessing.Event,
-    patience: int,
-):
-    """
-    Generator that yields data from the request queue, ensuring batch consistency
-    with the current model.
-
-    Parameters
-    ----------
-    request_queue : multiprocessing.Queue
-        Queue containing incoming requests.
-    current_model_path_holder : list
-        Single-element list holding the current model path for mutability.
-    stop_event : multiprocessing.Event
-        Event to signal the generator to stop.
-    patience : int
-        Time in seconds to wait for new requests before yielding the current batch.
-
-    Yields
-    ------
-    tuple
-        A tuple of image_bytes, group_id, identifier, model, and whitelist.
-    """
-    logging.debug("New data generator started")
-    time_since_last_request = time.time()
-    has_data = False
-
-    while not stop_event.is_set():
-        if not request_queue.empty():
-            try:
-                time_since_last_request = time.time()
-                data = request_queue.get()
-                # Unpack to normalize values before yielding
-                image_bytes, group_id, identifier, new_model_path, whitelist = data
-
-                # Ensure model path is always a string for tf.data (no None)
-                if new_model_path is None:
-                    new_model_path = current_model_path_holder[0]
-
-                # Re-pack the possibly updated tuple
-                data = (image_bytes, group_id, identifier, new_model_path, whitelist)
-
-                if new_model_path != current_model_path_holder[0]:
-                    request_queue.put(data)
-                    logging.info(
-                        "Model changed to '%s'. Switching generator.", new_model_path
-                    )
-                    current_model_path_holder[0] = new_model_path
-                    break  # Exit to allow dataset recreation with the new model
-
-                has_data = True
-                yield data
-            except Exception as e:
-                logging.error("Error retrieving data from queue: %s", e)
-        else:
-            time.sleep(0.01)  # Prevent busy waiting
-
-            if time.time() - time_since_last_request > patience and has_data:
-                logging.debug(
-                    "No new requests for %d seconds. Yielding remaining data.", patience
-                )
-                break
-
-    logging.debug("Data generator stopped")
-
-
-def create_dataset(
+def collect_batch(
     request_queue: multiprocessing.Queue,
     batch_size: int,
-    current_model_path_holder: list,
-    num_channels: int,
+    patience: float,
     stop_event: multiprocessing.Event,
-    patience: int,
-) -> tf.data.Dataset:
+    default_model_path: str,
+    leftover: tuple = None,
+) -> Tuple[list, tuple]:
     """
-    Create a TensorFlow dataset from the request queue.
+    Collect a batch of requests that all target the same model.
+
+    The batch is flushed when it is full, when no new requests arrive for
+    `patience` seconds, or when a request for a different model comes in.
 
     Parameters
     ----------
     request_queue : multiprocessing.Queue
         Queue containing incoming requests.
     batch_size : int
-        Number of samples per batch.
-    current_model_path_holder : list
-        Single-element list holding the current model path.
-    num_channels : int
-        Number of channels in the input images.
+        Maximum number of samples per batch.
+    patience : float
+        Time in seconds to wait for new requests before flushing the batch.
     stop_event : multiprocessing.Event
-        Event to signal the dataset creation to stop.
-    patience : int
-        Time in seconds to wait for new requests before yielding the current batch.
+        Event to signal the collector to stop.
+    default_model_path : str
+        Model path to use for requests that do not specify one.
+    leftover : tuple, optional
+        Request carried over from the previous batch after a model switch.
 
     Returns
     -------
-    tf.data.Dataset
-        Prepared TensorFlow dataset for batch processing.
+    tuple
+        A tuple of (items, leftover): `items` is a list of request tuples for
+        a single model; `leftover` is a request targeting a different model
+        that should start the next batch, or None.
     """
-    logging.debug("Creating TensorFlow dataset")
+    items = []
+    if leftover is not None:
+        items.append(leftover)
+    batch_model = items[0][3] if items else None
+    last_item_time = time.time()
 
-    dataset = tf.data.Dataset.from_generator(
-        lambda: data_generator(
-            request_queue, current_model_path_holder, stop_event, patience
-        ),
-        output_types=(tf.string, tf.string, tf.string, tf.string, tf.string),
-        output_shapes=((), (), (), (), (None,)),
+    while not stop_event.is_set() and len(items) < batch_size:
+        try:
+            data = request_queue.get(timeout=0.05)
+        except Empty:
+            if items and time.time() - last_item_time > patience:
+                logging.debug(
+                    "No new requests for %s seconds. Flushing batch.", patience
+                )
+                break
+            continue
+
+        image_bytes, group_id, identifier, model_path, whitelist = data
+
+        # Ensure model path is always a string (no None)
+        if model_path is None:
+            model_path = batch_model if batch_model else default_model_path
+        item = (image_bytes, group_id, identifier, model_path, whitelist)
+
+        if batch_model is None:
+            batch_model = model_path
+        elif model_path != batch_model:
+            logging.info(
+                "Model changed to '%s'. Flushing current batch.", model_path
+            )
+            return items, item
+
+        items.append(item)
+        last_item_time = time.time()
+
+    return items, None
+
+
+def build_padded_batch(images: List[np.ndarray]) -> np.ndarray:
+    """
+    Pad variable-width images into a single rectangular batch array.
+
+    Parameters
+    ----------
+    images : List[np.ndarray]
+        Preprocessed images in WHC layout with varying widths.
+
+    Returns
+    -------
+    np.ndarray
+        Batch array of shape [batch, width, height, channels], padded with
+        `PADDING_VALUE` up to a bucketed width.
+    """
+    max_width = max(image.shape[0] for image in images)
+    max_width = ((max_width + WIDTH_BUCKET - 1) // WIDTH_BUCKET) * WIDTH_BUCKET
+
+    batch = np.full(
+        (len(images), max_width) + images[0].shape[1:],
+        PADDING_VALUE,
+        dtype=np.float32,
     )
+    for i, image in enumerate(images):
+        batch[i, : image.shape[0]] = image
 
-    dataset = dataset.map(
-        lambda image, group_id, identifier, model, metadata: process_sample(
-            image, group_id, identifier, model, metadata, num_channels
-        ),
-        num_parallel_calls=tf.data.AUTOTUNE,
-        deterministic=False,
-    )
+    return batch
 
-    dataset = dataset.padded_batch(
-        batch_size=batch_size,
-        padded_shapes=(
-            [None, None, num_channels],  # Image shape
-            [],  # group_id
-            [],  # identifier
-            [],  # model
-            [None],  # metadata
-        ),
-        padding_values=(
-            tf.constant(-10, dtype=tf.float32),  # Image padding value
-            tf.constant("", dtype=tf.string),  # group_id padding
-            tf.constant("", dtype=tf.string),  # identifier padding
-            tf.constant("", dtype=tf.string),  # model padding
-            tf.constant("", dtype=tf.string),  # metadata padding
-        ),
-        drop_remainder=False,
-    )
 
-    dataset = dataset.prefetch(tf.data.AUTOTUNE)
-    logging.debug("TensorFlow dataset created successfully")
+def pad_whitelists(whitelists: List[List[str]], batch_len: int) -> tf.Tensor:
+    """
+    Pad whitelists into a rectangular string tensor for the decoder.
 
-    return dataset
+    Parameters
+    ----------
+    whitelists : List[List[str]]
+        Whitelist keys per sample.
+    batch_len : int
+        Number of samples in the batch.
+
+    Returns
+    -------
+    tf.Tensor
+        String tensor of shape [batch, max_whitelist_length], padded with "".
+    """
+    max_length = max((len(whitelist) for whitelist in whitelists), default=0)
+    if max_length == 0:
+        return tf.constant("", dtype=tf.string, shape=(batch_len, 0))
+
+    padded = [
+        list(whitelist) + [""] * (max_length - len(whitelist))
+        for whitelist in whitelists
+    ]
+    return tf.constant(padded, dtype=tf.string)
 
 
 def output_prediction_error(
@@ -553,6 +531,11 @@ def batch_prediction_worker(
     """
     Worker process for performing batch predictions on images.
 
+    Batching is done directly from the request queue in plain Python instead
+    of through a repeatedly recreated `tf.data.Dataset.from_generator`
+    pipeline: recreating that pipeline after every idle period leaked native
+    memory that was never reclaimed for the lifetime of the process.
+
     Parameters
     ----------
     request_queue : multiprocessing.Queue
@@ -593,66 +576,69 @@ def batch_prediction_worker(
         base_model_dir, current_model_path_holder[0], strategy
     )
 
+    leftover = None
     try:
         while not stop_event.is_set():
-            dataset = create_dataset(
+            batch, leftover = collect_batch(
                 request_queue,
                 batch_size,
-                current_model_path_holder,
-                num_channels,
-                stop_event,
                 patience,
+                stop_event,
+                current_model_path_holder[0],
+                leftover,
             )
 
-            for batch in dataset:
-                if stop_event.is_set():
-                    break
+            if not batch:
+                continue
 
+            # Check for model updates
+            model_path = batch[0][3]
+            if model_path != current_model_path_holder[0]:
+                logging.info(
+                    "Model switch detected. Replacing old model '%s' with model '%s'.",
+                    current_model_path_holder[0],
+                    model_path,
+                )
+                current_model_path_holder[0] = model_path
+                model, num_channels = create_model(
+                    base_model_dir, model_path, strategy
+                )
+                logging.debug("Model '%s' loaded successfully.", model_path)
+
+            # Preprocess and pad the batch
+            images = [
+                prepare_image(image_bytes, identifier, num_channels)
+                for image_bytes, _, identifier, _, _ in batch
+            ]
+            batch_images = build_padded_batch(images)
+
+            batch_groups = [group_id for _, group_id, _, _, _ in batch]
+            batch_identifiers = [identifier for _, _, identifier, _, _ in batch]
+            batch_whitelists = pad_whitelists(
+                [whitelist for _, _, _, _, whitelist in batch], len(batch)
+            )
+
+            # Perform predictions
+            batch_id = str(uuid.uuid4())
+            encoded_predictions = safe_predict(
+                model,
+                predicted_queue,
+                batch_images,
+                list(zip(batch_groups, batch_identifiers)),
+                error_output_path,
+                batch_id,
+            )
+            logging.debug("Predictions made for batch %s", batch_id)
+            predicted_queue.put(
                 (
-                    images,
-                    batch_groups,
-                    batch_identifiers,
-                    batch_models,
-                    batch_whitelist,
-                ) = batch
-                # Check for model updates
-                model_path = batch_models[0].numpy().decode("utf-8")
-                if (
-                    model_path != current_model_path_holder[0]
-                    and model_path is not None
-                ):
-                    logging.info(
-                        "Model switch detected. Replacing old model '%s' with model '%s'.",
-                        current_model_path_holder,
-                        model_path,
-                    )
-                    current_model_path_holder[0] = model_path
-                    model, num_channels = create_model(
-                        base_model_dir, model_path, strategy
-                    )
-                    logging.debug("Model '%s' loaded successfully.", model_path)
-
-                # Perform predictions
-                batch_id = str(uuid.uuid4())
-                encoded_predictions = safe_predict(
-                    model,
-                    predicted_queue,
-                    images,
-                    list(zip(batch_groups, batch_identifiers)),
-                    error_output_path,
+                    encoded_predictions,
+                    tf.constant(batch_groups, dtype=tf.string),
+                    tf.constant(batch_identifiers, dtype=tf.string),
+                    model_path,
                     batch_id,
+                    batch_whitelists,
                 )
-                logging.debug("Predictions made for batch %s", batch_id)
-                predicted_queue.put(
-                    (
-                        encoded_predictions,
-                        batch_groups,
-                        batch_identifiers,
-                        model_path,
-                        batch_id,
-                        batch_whitelist,
-                    )
-                )
+            )
     except Exception as e:
         logging.error("Error in batch prediction worker: %s", e)
         raise e
