@@ -27,9 +27,29 @@ from setup.environment import initialize_strategy  # noqa
 
 # Value used to pad variable-width images into a rectangular batch
 PADDING_VALUE = -10.0
-# Batch widths are rounded up to a multiple of this, so TensorFlow/Metal only
-# ever sees a bounded set of input shapes instead of a new one per batch
-WIDTH_BUCKET = 64
+# The Metal (and CUDA) allocator permanently retains a workspace for every
+# distinct input shape the model is ever called with, so inference must only
+# see a small fixed ladder of shapes. Widths are rounded up to one of these
+# buckets (and to a multiple of the largest bucket beyond it); the batch
+# dimension is likewise rounded up in build_padded_batch.
+WIDTH_BUCKETS = [256, 512, 1024, 1536, 2048, 3072, 4096, 6144, 8192]
+
+
+def bucket_width(width: int) -> int:
+    """Round a batch width up to a fixed bucket to bound the set of shapes."""
+    for bucket in WIDTH_BUCKETS:
+        if width <= bucket:
+            return bucket
+    largest = WIDTH_BUCKETS[-1]
+    return ((width + largest - 1) // largest) * largest
+
+
+def bucket_batch_len(length: int, batch_size: int) -> int:
+    """Round a batch length up to a power of two (capped at batch_size)."""
+    bucket = 1
+    while bucket < length and bucket < batch_size:
+        bucket *= 2
+    return min(bucket, batch_size)
 
 
 def setup_gpu_environment(gpus: str) -> List[tf.config.PhysicalDevice]:
@@ -208,30 +228,35 @@ def prepare_image(
     np.ndarray
         Preprocessed image in WHC layout.
     """
-    try:
-        image = tf.io.decode_image(
-            image_bytes, channels=num_channels, expand_animations=False
+    # Keep every preprocessing op on the CPU: in eager mode these ops would
+    # otherwise run on the Metal GPU device, whose allocator pools buffers per
+    # unique tensor size and never releases them — with arbitrary per-line
+    # widths that grows without bound.
+    with tf.device("/CPU:0"):
+        try:
+            image = tf.io.decode_image(
+                image_bytes, channels=num_channels, expand_animations=False
+            )
+        except tf.errors.InvalidArgumentError:
+            image = tf.zeros([64, 64, num_channels], dtype=tf.float32)
+            logging.error("Invalid image for identifier: %s", identifier)
+
+        # Resize and normalize the image
+        image = tf.image.resize(image, [64, 99999], preserve_aspect_ratio=True)
+        image = tf.cast(image, tf.float32) / 255.0
+
+        # Resize and pad the image
+        image = tf.image.resize_with_pad(
+            image, 64, tf.shape(image)[1] + 50, method=tf.image.ResizeMethod.BILINEAR
         )
-    except tf.errors.InvalidArgumentError:
-        image = tf.zeros([64, 64, num_channels], dtype=tf.float32)
-        logging.error("Invalid image for identifier: %s", identifier)
 
-    # Resize and normalize the image
-    image = tf.image.resize(image, [64, 99999], preserve_aspect_ratio=True)
-    image = tf.cast(image, tf.float32) / 255.0
+        # Normalize the image
+        image = 0.5 - image
 
-    # Resize and pad the image
-    image = tf.image.resize_with_pad(
-        image, 64, tf.shape(image)[1] + 50, method=tf.image.ResizeMethod.BILINEAR
-    )
+        # Transpose the image dimensions if necessary
+        image = tf.transpose(image, perm=[1, 0, 2])  # From HWC to WHC
 
-    # Normalize the image
-    image = 0.5 - image
-
-    # Transpose the image dimensions if necessary
-    image = tf.transpose(image, perm=[1, 0, 2])  # From HWC to WHC
-
-    return image.numpy()
+        return image.numpy()
 
 
 def collect_batch(
@@ -308,30 +333,37 @@ def collect_batch(
     return items, None
 
 
-def build_padded_batch(images: List[np.ndarray]) -> np.ndarray:
+def build_padded_batch(images: List[np.ndarray], batch_size: int) -> np.ndarray:
     """
     Pad variable-width images into a single rectangular batch array.
+
+    Both the width and the batch dimension are rounded up to fixed buckets so
+    the model only ever sees a bounded set of input shapes; extra rows repeat
+    real images and their predictions must be discarded by the caller.
 
     Parameters
     ----------
     images : List[np.ndarray]
         Preprocessed images in WHC layout with varying widths.
+    batch_size : int
+        Maximum (and bucket cap for the) batch dimension.
 
     Returns
     -------
     np.ndarray
-        Batch array of shape [batch, width, height, channels], padded with
-        `PADDING_VALUE` up to a bucketed width.
+        Batch array of shape [bucketed_batch, bucketed_width, height,
+        channels], padded with `PADDING_VALUE`.
     """
-    max_width = max(image.shape[0] for image in images)
-    max_width = ((max_width + WIDTH_BUCKET - 1) // WIDTH_BUCKET) * WIDTH_BUCKET
+    max_width = bucket_width(max(image.shape[0] for image in images))
+    batch_len = bucket_batch_len(len(images), batch_size)
 
     batch = np.full(
-        (len(images), max_width) + images[0].shape[1:],
+        (batch_len, max_width) + images[0].shape[1:],
         PADDING_VALUE,
         dtype=np.float32,
     )
-    for i, image in enumerate(images):
+    for i in range(batch_len):
+        image = images[i % len(images)]
         batch[i, : image.shape[0]] = image
 
     return batch
@@ -610,7 +642,7 @@ def batch_prediction_worker(
                 prepare_image(image_bytes, identifier, num_channels)
                 for image_bytes, _, identifier, _, _ in batch
             ]
-            batch_images = build_padded_batch(images)
+            batch_images = build_padded_batch(images, batch_size)
 
             batch_groups = [group_id for _, group_id, _, _, _ in batch]
             batch_identifiers = [identifier for _, _, identifier, _, _ in batch]
@@ -618,16 +650,22 @@ def batch_prediction_worker(
                 [whitelist for _, _, _, _, whitelist in batch], len(batch)
             )
 
-            # Perform predictions
+            # Filler rows repeat real images, so their info repeats too
+            batch_info = [
+                (batch_groups[i % len(batch)], batch_identifiers[i % len(batch)])
+                for i in range(len(batch_images))
+            ]
+
+            # Perform predictions; discard predictions for filler rows
             batch_id = str(uuid.uuid4())
             encoded_predictions = safe_predict(
                 model,
                 predicted_queue,
                 batch_images,
-                list(zip(batch_groups, batch_identifiers)),
+                batch_info,
                 error_output_path,
                 batch_id,
-            )
+            )[: len(batch)]
             logging.debug("Predictions made for batch %s", batch_id)
             predicted_queue.put(
                 (
